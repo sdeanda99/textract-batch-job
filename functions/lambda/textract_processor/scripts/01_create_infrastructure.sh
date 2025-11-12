@@ -1,0 +1,178 @@
+#!/bin/bash
+
+set -e
+
+# Load environment variables from .env file
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/../.env"
+
+if [ ! -f "$ENV_FILE" ]; then
+    echo "Error: .env file not found at $ENV_FILE"
+    echo "Please copy .env.example to .env and configure your settings:"
+    echo "  cp $SCRIPT_DIR/../.env.example $ENV_FILE"
+    exit 1
+fi
+
+# Export variables from .env
+set -a
+source "$ENV_FILE"
+set +a
+
+# Configuration from environment variables
+REGION="${AWS_REGION:-us-east-1}"
+AWS_PROFILE="${AWS_PROFILE:-default}"
+ACCOUNT_ID=$(aws sts get-caller-identity --profile $AWS_PROFILE --query Account --output text)
+
+echo "====================================================================="
+echo "Creating AWS Infrastructure for Textract Processing"
+echo "====================================================================="
+echo ""
+echo "Account ID: $ACCOUNT_ID"
+echo "Region: $REGION"
+echo "Profile: $AWS_PROFILE"
+echo ""
+
+# 1. Create DynamoDB Table
+echo "====================================================================="
+echo "1. Creating DynamoDB Table: $DYNAMODB_TABLE_NAME"
+echo "====================================================================="
+
+if aws dynamodb describe-table --table-name $DYNAMODB_TABLE_NAME --profile $AWS_PROFILE --region $REGION 2>/dev/null; then
+    echo "  ✓ Table '$DYNAMODB_TABLE_NAME' already exists"
+else
+    aws dynamodb create-table \
+        --table-name $DYNAMODB_TABLE_NAME \
+        --attribute-definitions AttributeName=JobId,AttributeType=S \
+        --key-schema AttributeName=JobId,KeyType=HASH \
+        --billing-mode PAY_PER_REQUEST \
+        --profile $AWS_PROFILE \
+        --region $REGION
+
+    echo "  ✓ Table '$DYNAMODB_TABLE_NAME' created"
+    echo "  Waiting for table to be active..."
+    aws dynamodb wait table-exists --table-name $DYNAMODB_TABLE_NAME --profile $AWS_PROFILE --region $REGION
+    echo "  ✓ Table is active"
+fi
+
+echo ""
+
+# 2. Create SNS Topic
+echo "====================================================================="
+echo "2. Creating SNS Topic: $SNS_TOPIC_NAME"
+echo "====================================================================="
+
+SNS_TOPIC_ARN=$(aws sns create-topic \
+    --name $SNS_TOPIC_NAME \
+    --profile $AWS_PROFILE \
+    --region $REGION \
+    --query TopicArn \
+    --output text)
+
+echo "  ✓ SNS Topic ARN: $SNS_TOPIC_ARN"
+echo ""
+
+# 3. Create SQS Queue
+echo "====================================================================="
+echo "3. Creating SQS Queue: $SQS_QUEUE_NAME"
+echo "====================================================================="
+
+SQS_QUEUE_URL=$(aws sqs create-queue \
+    --queue-name $SQS_QUEUE_NAME \
+    --profile $AWS_PROFILE \
+    --region $REGION \
+    --query QueueUrl \
+    --output text 2>/dev/null || aws sqs get-queue-url \
+    --queue-name $SQS_QUEUE_NAME \
+    --profile $AWS_PROFILE \
+    --region $REGION \
+    --query QueueUrl \
+    --output text)
+
+SQS_QUEUE_ARN=$(aws sqs get-queue-attributes \
+    --queue-url $SQS_QUEUE_URL \
+    --attribute-names QueueArn \
+    --profile $AWS_PROFILE \
+    --region $REGION \
+    --query 'Attributes.QueueArn' \
+    --output text)
+
+echo "  ✓ SQS Queue URL: $SQS_QUEUE_URL"
+echo "  ✓ SQS Queue ARN: $SQS_QUEUE_ARN"
+echo ""
+
+# 4. Set SQS Queue Policy to allow SNS to send messages
+echo "====================================================================="
+echo "4. Configuring SQS Queue Policy"
+echo "====================================================================="
+
+# Create policy JSON escaped properly
+SQS_POLICY_JSON="{\\\"Version\\\":\\\"2012-10-17\\\",\\\"Statement\\\":[{\\\"Effect\\\":\\\"Allow\\\",\\\"Principal\\\":{\\\"Service\\\":\\\"sns.amazonaws.com\\\"},\\\"Action\\\":\\\"sqs:SendMessage\\\",\\\"Resource\\\":\\\"$SQS_QUEUE_ARN\\\",\\\"Condition\\\":{\\\"ArnEquals\\\":{\\\"aws:SourceArn\\\":\\\"$SNS_TOPIC_ARN\\\"}}}]}"
+
+aws sqs set-queue-attributes \
+    --queue-url "$SQS_QUEUE_URL" \
+    --attributes "{\"Policy\":\"$SQS_POLICY_JSON\"}" \
+    --profile $AWS_PROFILE \
+    --region $REGION
+
+echo "  ✓ SQS Queue policy configured"
+echo ""
+
+# 5. Subscribe SQS to SNS
+echo "====================================================================="
+echo "5. Subscribing SQS Queue to SNS Topic"
+echo "====================================================================="
+
+SUBSCRIPTION_ARN=$(aws sns subscribe \
+    --topic-arn $SNS_TOPIC_ARN \
+    --protocol sqs \
+    --notification-endpoint $SQS_QUEUE_ARN \
+    --profile $AWS_PROFILE \
+    --region $REGION \
+    --query SubscriptionArn \
+    --output text)
+
+echo "  ✓ Subscription ARN: $SUBSCRIPTION_ARN"
+echo ""
+
+# Save ARNs to a file for use in other scripts
+echo "====================================================================="
+echo "6. Saving configuration"
+echo "====================================================================="
+
+CONFIG_FILE="$(dirname "$0")/infrastructure_config.sh"
+cat > $CONFIG_FILE <<EOF
+#!/bin/bash
+# Auto-generated by 01_create_infrastructure.sh
+# Generated at: $(date)
+
+export AWS_ACCOUNT_ID="$ACCOUNT_ID"
+export AWS_REGION="$REGION"
+export AWS_PROFILE="$AWS_PROFILE"
+export SNS_TOPIC_ARN="$SNS_TOPIC_ARN"
+export SQS_QUEUE_URL="$SQS_QUEUE_URL"
+export SQS_QUEUE_ARN="$SQS_QUEUE_ARN"
+export SUBSCRIPTION_ARN="$SUBSCRIPTION_ARN"
+EOF
+
+chmod +x $CONFIG_FILE
+
+echo "  ✓ Configuration saved to: $CONFIG_FILE"
+echo ""
+
+echo "====================================================================="
+echo "✓ Infrastructure Creation Complete!"
+echo "====================================================================="
+echo ""
+echo "Summary:"
+echo "  - DynamoDB Table: $DYNAMODB_TABLE_NAME"
+echo "  - SNS Topic: $SNS_TOPIC_ARN"
+echo "  - SQS Queue: $SQS_QUEUE_ARN"
+echo "  - Subscription: $SUBSCRIPTION_ARN"
+echo "  - Source Bucket: $SOURCE_BUCKET"
+echo "  - Output Bucket: $OUTPUT_BUCKET"
+echo "  - Output Prefix: $OUTPUT_PREFIX"
+echo ""
+echo "Next steps:"
+echo "  1. Run: ./02_create_iam_roles.sh"
+echo "  2. Run: ./03_deploy_lambdas.sh"
+echo ""

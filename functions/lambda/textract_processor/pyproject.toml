@@ -1,0 +1,12 @@
+[project]
+name = "textract-processor"
+version = "0.1.0"
+description = "AWS Textract PDF processing and result conversion"
+requires-python = ">=3.12"
+dependencies = [
+    "openpyxl>=3.1.2",
+    "boto3>=1.35.0",
+]
+
+[tool.uv]
+dev-dependencies = []
